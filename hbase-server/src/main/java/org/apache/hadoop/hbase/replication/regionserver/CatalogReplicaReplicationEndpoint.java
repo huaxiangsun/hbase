@@ -20,28 +20,37 @@ package org.apache.hadoop.hbase.replication.regionserver;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.RegionLocations;
+import org.apache.hadoop.hbase.ScheduledChore;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.client.AsyncClusterConnection;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionReplicaUtil;
 import org.apache.hadoop.hbase.client.TableDescriptor;
+import org.apache.hadoop.hbase.regionserver.FlushRequester;
+import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.replication.BaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.WALEntryFilter;
 import org.apache.hadoop.hbase.util.AtomicUtils;
@@ -50,10 +59,12 @@ import org.apache.hadoop.hbase.util.FutureUtils;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.util.RetryCounterFactory;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import static org.apache.hadoop.hbase.replication.ReplicationUtils.sleepForRetries;
 
 /**
  * A {@link org.apache.hadoop.hbase.replication.ReplicationEndpoint} endpoint which receives the WAL
@@ -80,6 +91,8 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   private final RetryCounterFactory retryCounterFactory =
     new RetryCounterFactory(Integer.MAX_VALUE, 1000, 60000);
+
+  private CatalogReplicaShipper[] replicaShippers;
 
   @Override
   public void init(Context context) throws IOException {
@@ -117,226 +130,23 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
     return entry.getEdit().isMetaEdit();
   }
 
-  private void getRegionLocations(CompletableFuture<RegionLocations> future,
-      TableDescriptor tableDesc, byte[] encodedRegionName, byte[] row, boolean reload) {
-    FutureUtils.addListener(connection.getRegionLocations(tableDesc.getTableName(), row, reload),
-      (locs, e) -> {
-        if (e != null) {
-          future.completeExceptionally(e);
-          return;
-        }
-        // if we are not loading from cache, just return
-        if (reload) {
-          future.complete(locs);
-          return;
-        }
-        // check if the number of region replicas is correct, and also the primary region name
-        // matches.
-        if (locs.size() == tableDesc.getRegionReplication() &&
-          locs.getDefaultRegionLocation() != null &&
-          Bytes.equals(locs.getDefaultRegionLocation().getRegion().getEncodedNameAsBytes(),
-            encodedRegionName)) {
-          future.complete(locs);
-        } else {
-          // reload again as the information in cache maybe stale
-          getRegionLocations(future, tableDesc, encodedRegionName, row, true);
-        }
-      });
-  }
-
-  private void replicate(CompletableFuture<Long> future, RegionLocations locs,
-      TableDescriptor tableDesc, byte[] encodedRegionName, byte[] row, List<Entry> entries) {
-    if (locs.size() == 1) {
-      // Could this happen?
-      future.complete(Long.valueOf(entries.size()));
-      return;
-    }
-    RegionInfo defaultReplica = locs.getDefaultRegionLocation().getRegion();
-    if (!Bytes.equals(defaultReplica.getEncodedNameAsBytes(), encodedRegionName)) {
-      // the region name is not equal, this usually means the region has been split or merged, so
-      // give up replicating as the new region(s) should already have all the data of the parent
-      // region(s).
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(
-          "Skipping {} entries in table {} because located region {} is different than" +
-            " the original region {} from WALEdit",
-          tableDesc.getTableName(), defaultReplica.getEncodedName(),
-          Bytes.toStringBinary(encodedRegionName));
-      }
-      future.complete(Long.valueOf(entries.size()));
-      return;
-    }
-    AtomicReference<Throwable> error = new AtomicReference<>();
-    AtomicInteger remainingTasks = new AtomicInteger(locs.size() - 1);
-    AtomicLong skippedEdits = new AtomicLong(0);
-
-    for (int i = 1, n = locs.size(); i < n; i++) {
-      // Do not use the elements other than the default replica as they may be null. We will fail
-      // earlier if the location for default replica is null.
-      final RegionInfo replica = RegionReplicaUtil.getRegionInfoForReplica(defaultReplica, i);
-      FutureUtils
-        .addListener(connection.replay(tableDesc.getTableName(), replica.getEncodedNameAsBytes(),
-          row, entries, replica.getReplicaId(), numRetries, operationTimeoutNs), (r, e) -> {
-            if (e != null) {
-              LOG.warn("Failed to replicate to {}", replica, e);
-              error.compareAndSet(null, e);
-            } else {
-              AtomicUtils.updateMax(skippedEdits, r.longValue());
-            }
-            if (remainingTasks.decrementAndGet() == 0) {
-              if (error.get() != null) {
-                future.completeExceptionally(error.get());
-              } else {
-                future.complete(skippedEdits.get());
-              }
-            }
-          });
-    }
-  }
-
-  private void logSkipped(TableName tableName, List<Entry> entries, String reason) {
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("Skipping {} entries because table {} is {}", entries.size(), tableName, reason);
-      for (Entry entry : entries) {
-        LOG.trace("Skipping : {}", entry);
-      }
-    }
-  }
-
-  private CompletableFuture<Long> replicate(TableDescriptor tableDesc, byte[] encodedRegionName,
-      List<Entry> entries) {
-    byte[] row = CellUtil.cloneRow(entries.get(0).getEdit().getCells().get(0));
-    CompletableFuture<RegionLocations> locateFuture = new CompletableFuture<>();
-    getRegionLocations(locateFuture, tableDesc, encodedRegionName, row, false);
-    CompletableFuture<Long> future = new CompletableFuture<>();
-    FutureUtils.addListener(locateFuture, (locs, error) -> {
-      if (error != null) {
-        future.completeExceptionally(error);
-      } else if (locs.getDefaultRegionLocation() == null) {
-        future.completeExceptionally(
-          new HBaseIOException("No location found for default replica of table=" +
-            tableDesc.getTableName() + " row='" + Bytes.toStringBinary(row) + "'"));
-      } else {
-        replicate(future, locs, tableDesc, encodedRegionName, row, entries);
-      }
-    });
-    return future;
-  }
-
   @Override
   public boolean replicate(ReplicateContext replicateContext) {
-    Map<byte[], Pair<TableDescriptor, List<Entry>>> encodedRegionName2Entries =
-      new TreeMap<>(Bytes.BYTES_COMPARATOR);
-    long skippedEdits = 0;
-    RetryCounter retryCounter = retryCounterFactory.create();
-    outer: while (isRunning()) {
-      encodedRegionName2Entries.clear();
-      skippedEdits = 0;
-      for (Entry entry : replicateContext.getEntries()) {
-        Optional<TableDescriptor> tableDesc;
-        try {
-          tableDesc = tableDescriptorCache.get(entry.getKey().getTableName());
-        } catch (ExecutionException e) {
-          LOG.warn("Failed to load table descriptor for {}, attempts={}",
-            entry.getKey().getTableName(), retryCounter.getAttemptTimes(), e.getCause());
-          if (!retryCounter.shouldRetry()) {
-            return false;
-          }
-          try {
-            retryCounter.sleepUntilNextRetry();
-          } catch (InterruptedException e1) {
-            // restore the interrupted state
-            Thread.currentThread().interrupt();
-            return false;
-          }
-          continue outer;
-        }
-        if (!requiresReplication(tableDesc, entry)) {
-          skippedEdits++;
-          continue;
-        }
-        byte[] encodedRegionName = entry.getKey().getEncodedRegionName();
-        encodedRegionName2Entries
-          .computeIfAbsent(encodedRegionName, k -> Pair.newPair(tableDesc.get(), new ArrayList<>()))
-          .getSecond().add(entry);
+    Iterator<Entry> itr = replicateContext.getEntries().iterator();
+    while (itr.hasNext()) {
+      if (!requiresReplication(itr.next())) {
+        itr.remove();
       }
-      break;
-    }
-    // send the request to regions
-    retryCounter = retryCounterFactory.create();
-    while (isRunning()) {
-      List<Pair<CompletableFuture<Long>, byte[]>> futureAndEncodedRegionNameList =
-        new ArrayList<Pair<CompletableFuture<Long>, byte[]>>();
-      for (Map.Entry<byte[], Pair<TableDescriptor, List<Entry>>> entry : encodedRegionName2Entries
-        .entrySet()) {
-        CompletableFuture<Long> future =
-          replicate(entry.getValue().getFirst(), entry.getKey(), entry.getValue().getSecond());
-        futureAndEncodedRegionNameList.add(Pair.newPair(future, entry.getKey()));
-      }
-      for (Pair<CompletableFuture<Long>, byte[]> pair : futureAndEncodedRegionNameList) {
-        byte[] encodedRegionName = pair.getSecond();
-        try {
-          skippedEdits += pair.getFirst().get().longValue();
-          encodedRegionName2Entries.remove(encodedRegionName);
-        } catch (InterruptedException e) {
-          // restore the interrupted state
-          Thread.currentThread().interrupt();
-          return false;
-        } catch (ExecutionException e) {
-          Pair<TableDescriptor, List<Entry>> tableAndEntries =
-            encodedRegionName2Entries.get(encodedRegionName);
-          TableName tableName = tableAndEntries.getFirst().getTableName();
-          List<Entry> entries = tableAndEntries.getSecond();
-          Throwable cause = e.getCause();
-          // The table can be disabled or dropped at this time. For disabled tables, we have no
-          // cheap mechanism to detect this case because meta does not contain this information.
-          // ClusterConnection.isTableDisabled() is a zk call which we cannot do for every replay
-          // RPC. So instead we start the replay RPC with retries and check whether the table is
-          // dropped or disabled which might cause SocketTimeoutException, or
-          // RetriesExhaustedException or similar if we get IOE.
-          if (cause instanceof TableNotFoundException) {
-            // add to cache that the table does not exist
-            tableDescriptorCache.put(tableName, Optional.empty());
-            logSkipped(tableName, entries, "dropped");
-            skippedEdits += entries.size();
-            encodedRegionName2Entries.remove(encodedRegionName);
-            continue;
-          }
-          boolean disabled = false;
-          try {
-            disabled = connection.getAdmin().isTableDisabled(tableName).get();
-          } catch (InterruptedException e1) {
-            // restore the interrupted state
-            Thread.currentThread().interrupt();
-            return false;
-          } catch (ExecutionException e1) {
-            LOG.warn("Failed to test whether {} is disabled, assume it is not disabled", tableName,
-              e1.getCause());
-          }
-          LOG.warn("Failed to replicate {} entries for region {} of table {}", entries.size(),
-            Bytes.toStringBinary(encodedRegionName), tableName);
-        }
-      }
-      // we have done
-      if (encodedRegionName2Entries.isEmpty()) {
-        ctx.getMetrics().incrLogEditsFiltered(skippedEdits);
-        return true;
-      } else {
-        LOG.warn("Failed to replicate all entris, retry={}", retryCounter.getAttemptTimes());
-        if (!retryCounter.shouldRetry()) {
-          return false;
-        }
-        try {
-          retryCounter.sleepUntilNextRetry();
-        } catch (InterruptedException e) {
-          // restore the interrupted state
-          Thread.currentThread().interrupt();
-          return false;
-        }
+      // TODO: need to break start_flush and commit_flush, do clean up as necessary.
+      if (false) {
+
       }
     }
 
-    return false;
+    for (CatalogReplicaShipper shipper : replicaShippers) {
+      shipper.addEditEntry(replicateContext.getEntries());
+    }
+    return true;
   }
 
   @Override
@@ -374,4 +184,183 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
   protected void doStop() {
     notifyStopped();
   }
+
+  public int getNumRetries() {
+    return numRetries;
+  }
+
+  public long getOperationTimeoutNs() {
+    return operationTimeoutNs;
+  }
+
+  private static class CatalogReplicaShipper extends Thread {
+    private final CatalogReplicaReplicationEndpoint endpoint;
+    private LinkedBlockingQueue<List<Entry>> queue;
+    private final AsyncClusterConnection conn;
+    //Indicates whether this particular worker is running
+    private boolean isRunning = true;
+    private HRegionLocation location;
+    private final TableDescriptor td = null;
+    private RegionInfo regionInfo;
+    private int numRetries;
+    private long operationTimeoutNs;
+
+
+    CatalogReplicaShipper (final CatalogReplicaReplicationEndpoint endpoint,
+      final AsyncClusterConnection connection) {
+      this.endpoint = endpoint;
+      this.conn = connection;
+      this.queue = new LinkedBlockingQueue<>();
+      this.numRetries = endpoint.getNumRetries();
+      this.operationTimeoutNs = endpoint.getOperationTimeoutNs();
+
+    }
+
+    private void cleanQueue(final long startFlushSeqOpId) {
+      // remove entries with seq# less than startFlushSeqOpId
+      // TODO: needs more touchup.
+      queue.removeIf(n -> (n.get(0).getKey().getSequenceId() < startFlushSeqOpId));
+    }
+
+    // TODO: this needs revisit.
+    public void addEditEntry(final List<Entry> entries) {
+      try {
+        // TODO: for start_flush/commit_flush, it is going to be only one walEdit in the batch
+        // logic such as following needs to be added.
+        //  if (entries.get(0).getKey is commit_flush) {
+        //    cleanQueue(0);
+        //  }
+        queue.put(entries);
+      } catch (InterruptedException e) {
+
+      }
+    }
+
+    private CompletableFuture<Long> replicate(List<Entry> entries) {
+      CompletableFuture<Long> future = new CompletableFuture<>();
+      // For MetaFamily such flush events, the key is the start key of the region,
+      // just reuse same thing here.
+      byte[] row = CellUtil.cloneRow(entries.get(0).getEdit().getCells().get(0));
+      FutureUtils
+        .addListener(conn.replay(td.getTableName(), regionInfo.getEncodedNameAsBytes(),
+          row, entries, regionInfo.getReplicaId(), 1, operationTimeoutNs), (r, e) -> {
+          if (e != null) {
+            LOG.warn("Failed to replicate to {}", regionInfo, e);
+            future.completeExceptionally(e);
+            // TODO: need to refresh meta location in case of error.
+          } else {
+            future.complete(r.longValue());
+          }
+        });
+
+      return future;
+    }
+
+    @Override
+    public final void run() {
+      while (isRunning()) { // we only loop back here if something fatal happened to our stream
+        try {
+          List<Entry> entries = queue.poll(20000, TimeUnit.MILLISECONDS);
+          if (entries == null) {
+            continue;
+          }
+
+          CompletableFuture<Long> future =
+            replicate(entries);
+
+          try {
+            future.get().longValue();
+          } catch (InterruptedException e) {
+            // restore the interrupted state
+            Thread.currentThread().interrupt();
+            continue;
+          } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            LOG.warn("Failed to replicate {} entries for region  of meta table", entries.size());
+          }
+        } catch (InterruptedException | ReplicationRuntimeException e) {
+          // It is interrupted and needs to quit.
+          LOG.warn("Interrupted while waiting for next replication entry batch", e);
+          Thread.currentThread().interrupt();
+        }
+      }
+      // TODO: what if it breaks the loop now.
+    }
+
+    /**
+     * @return whether the thread is running
+     */
+    public boolean isRunning() {
+      return isRunning && !isInterrupted();
+    }
+
+    /**
+     * @param running the running to set
+     */
+    public void setRunning(boolean running) {
+      this.isRunning = running;
+    }
+
+  }
 }
+
+  private void replicate(CompletableFuture<Long> future, RegionLocations locs,
+    TableDescriptor tableDesc, byte[] encodedRegionName, byte[] row, List<Entry> entries) {
+    if (locs.size() == 1) {
+      // Could this happen?
+      future.complete(Long.valueOf(entries.size()));
+      return;
+    }
+    RegionInfo defaultReplica = locs.getDefaultRegionLocation().getRegion();
+    if (!Bytes.equals(defaultReplica.getEncodedNameAsBytes(), encodedRegionName)) {
+      // the region name is not equal, this usually means the region has been split or merged, so
+      // give up replicating as the new region(s) should already have all the data of the parent
+      // region(s).
+      if (LOG.isTraceEnabled()) {
+        LOG.trace(
+          "Skipping {} entries in table {} because located region {} is different than" +
+            " the original region {} from WALEdit",
+          tableDesc.getTableName(), defaultReplica.getEncodedName(),
+          Bytes.toStringBinary(encodedRegionName));
+      }
+      future.complete(Long.valueOf(entries.size()));
+      return;
+    }
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    AtomicInteger remainingTasks = new AtomicInteger(locs.size() - 1);
+    AtomicLong skippedEdits = new AtomicLong(0);
+
+    for (int i = 1, n = locs.size(); i < n; i++) {
+      // Do not use the elements other than the default replica as they may be null. We will fail
+      // earlier if the location for default replica is null.
+      final RegionInfo replica = RegionReplicaUtil.getRegionInfoForReplica(defaultReplica, i);
+      FutureUtils
+        .addListener(connection.replay(tableDesc.getTableName(), replica.getEncodedNameAsBytes(),
+          row, entries, replica.getReplicaId(), numRetries, operationTimeoutNs), (r, e) -> {
+          if (e != null) {
+            LOG.warn("Failed to replicate to {}", replica, e);
+            error.compareAndSet(null, e);
+          } else {
+            AtomicUtils.updateMax(skippedEdits, r.longValue());
+          }
+          if (remainingTasks.decrementAndGet() == 0) {
+            if (error.get() != null) {
+              future.completeExceptionally(error.get());
+            } else {
+              future.complete(skippedEdits.get());
+            }
+          }
+        });
+    }
+  }
+
+  private void logSkipped(TableName tableName, List<Entry> entries, String reason) {
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Skipping {} entries because table {} is {}", entries.size(), tableName, reason);
+      for (Entry entry : entries) {
+        LOG.trace("Skipping : {}", entry);
+      }
+    }
+  }
+
+

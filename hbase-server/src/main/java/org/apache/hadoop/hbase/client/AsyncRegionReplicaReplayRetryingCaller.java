@@ -63,6 +63,8 @@ public class AsyncRegionReplicaReplayRetryingCaller extends AsyncRpcRetryingCall
 
   private final int replicaId;
 
+  private final HRegionLocation loc;
+
   public AsyncRegionReplicaReplayRetryingCaller(HashedWheelTimer retryTimer,
       AsyncClusterConnectionImpl conn, int maxAttempts, long operationTimeoutNs,
       TableName tableName, byte[] encodedRegionName, byte[] row, List<Entry> entries,
@@ -75,6 +77,24 @@ public class AsyncRegionReplicaReplayRetryingCaller extends AsyncRpcRetryingCall
     this.row = row;
     this.entries = entries.toArray(new Entry[0]);
     this.replicaId = replicaId;
+    this.loc = null;
+  }
+
+  // TODO: Think that it is able to handle meta regions, do we need to add code to handle errors?
+  // HOw about flush/compaction events?
+  public AsyncRegionReplicaReplayRetryingCaller(HashedWheelTimer retryTimer,
+    AsyncClusterConnectionImpl conn, int maxAttempts, long operationTimeoutNs,
+    TableName tableName, byte[] encodedRegionName, List<Entry> entries, HRegionLocation loc,
+    int replicaId) {
+    super(retryTimer, conn, ConnectionUtils.getPriority(tableName), conn.connConf.getPauseNs(),
+      conn.connConf.getPauseForCQTBENs(), maxAttempts, operationTimeoutNs,
+      conn.connConf.getWriteRpcTimeoutNs(), conn.connConf.getStartLogErrorsCnt());
+    this.tableName = tableName;
+    this.entries = entries.toArray(new Entry[0]);
+    this.replicaId = replicaId;
+    this.encodedRegionName = encodedRegionName;
+    row = null;
+    this.loc = loc;
   }
 
   private void call(HRegionLocation loc) {
@@ -118,7 +138,6 @@ public class AsyncRegionReplicaReplayRetryingCaller extends AsyncRpcRetryingCall
         future.complete(0L);
       }
     });
-
   }
 
   @Override
@@ -133,15 +152,19 @@ public class AsyncRegionReplicaReplayRetryingCaller extends AsyncRpcRetryingCall
     } else {
       locateTimeoutNs = -1L;
     }
-    addListener(conn.getLocator().getRegionLocation(tableName, row, replicaId,
-      RegionLocateType.CURRENT, locateTimeoutNs), (loc, error) -> {
+    if (loc == null) {
+      addListener(conn.getLocator()
+        .getRegionLocation(tableName, row, replicaId, RegionLocateType.CURRENT, locateTimeoutNs), (loc, error) -> {
         if (error != null) {
-          onError(error,
-            () -> "Locate '" + Bytes.toStringBinary(row) + "' in " + tableName + " failed", err -> {
+          onError(error, () -> "Locate '" + Bytes.toStringBinary(row) + "' in " + tableName + " failed",
+            err -> {
             });
           return;
         }
         call(loc);
       });
+    } else {
+      call(this.loc);
+    }
   }
 }

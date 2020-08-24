@@ -744,6 +744,8 @@ public class ReplicationSourceManager implements ReplicationListener {
     }
     String queueId = source.getQueueId();
     for (String wal : wals) {
+      // SHX-TODO: with meta replication, the queueStorage is null, in this case, it does not need
+      // to do clean up, or queueStorage is RAM based?
       interruptOrAbortWhenFail(
         () -> this.queueStorage.removeWAL(server.getServerName(), queueId, wal));
     }

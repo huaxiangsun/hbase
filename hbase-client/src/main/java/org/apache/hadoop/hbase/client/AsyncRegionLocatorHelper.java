@@ -89,6 +89,7 @@ final class AsyncRegionLocatorHelper {
         metrics.incrCacheDroppingExceptions(exception);
       }
       removeFromCache.accept(loc);
+      // TODO: SHX, in this case, we need to go to primary if this is the case?
     }
   }
 
