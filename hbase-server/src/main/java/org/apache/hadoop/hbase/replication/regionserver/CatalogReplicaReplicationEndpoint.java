@@ -137,10 +137,6 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       if (!requiresReplication(itr.next())) {
         itr.remove();
       }
-      // TODO: need to break start_flush and commit_flush, do clean up as necessary.
-      if (false) {
-
-      }
     }
 
     for (CatalogReplicaShipper shipper : replicaShippers) {
@@ -247,7 +243,8 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
           if (e != null) {
             LOG.warn("Failed to replicate to {}", regionInfo, e);
             future.completeExceptionally(e);
-            // TODO: need to refresh meta location in case of error.
+            // TODO: need to refresh meta location in case of error. Different Exception handled
+            // differently?
           } else {
             future.complete(r.longValue());
           }
@@ -303,64 +300,4 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   }
 }
-
-  private void replicate(CompletableFuture<Long> future, RegionLocations locs,
-    TableDescriptor tableDesc, byte[] encodedRegionName, byte[] row, List<Entry> entries) {
-    if (locs.size() == 1) {
-      // Could this happen?
-      future.complete(Long.valueOf(entries.size()));
-      return;
-    }
-    RegionInfo defaultReplica = locs.getDefaultRegionLocation().getRegion();
-    if (!Bytes.equals(defaultReplica.getEncodedNameAsBytes(), encodedRegionName)) {
-      // the region name is not equal, this usually means the region has been split or merged, so
-      // give up replicating as the new region(s) should already have all the data of the parent
-      // region(s).
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(
-          "Skipping {} entries in table {} because located region {} is different than" +
-            " the original region {} from WALEdit",
-          tableDesc.getTableName(), defaultReplica.getEncodedName(),
-          Bytes.toStringBinary(encodedRegionName));
-      }
-      future.complete(Long.valueOf(entries.size()));
-      return;
-    }
-    AtomicReference<Throwable> error = new AtomicReference<>();
-    AtomicInteger remainingTasks = new AtomicInteger(locs.size() - 1);
-    AtomicLong skippedEdits = new AtomicLong(0);
-
-    for (int i = 1, n = locs.size(); i < n; i++) {
-      // Do not use the elements other than the default replica as they may be null. We will fail
-      // earlier if the location for default replica is null.
-      final RegionInfo replica = RegionReplicaUtil.getRegionInfoForReplica(defaultReplica, i);
-      FutureUtils
-        .addListener(connection.replay(tableDesc.getTableName(), replica.getEncodedNameAsBytes(),
-          row, entries, replica.getReplicaId(), numRetries, operationTimeoutNs), (r, e) -> {
-          if (e != null) {
-            LOG.warn("Failed to replicate to {}", replica, e);
-            error.compareAndSet(null, e);
-          } else {
-            AtomicUtils.updateMax(skippedEdits, r.longValue());
-          }
-          if (remainingTasks.decrementAndGet() == 0) {
-            if (error.get() != null) {
-              future.completeExceptionally(error.get());
-            } else {
-              future.complete(skippedEdits.get());
-            }
-          }
-        });
-    }
-  }
-
-  private void logSkipped(TableName tableName, List<Entry> entries, String reason) {
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("Skipping {} entries because table {} is {}", entries.size(), tableName, reason);
-      for (Entry entry : entries) {
-        LOG.trace("Skipping : {}", entry);
-      }
-    }
-  }
-
 
