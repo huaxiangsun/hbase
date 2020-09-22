@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.RegionLocations;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -30,6 +31,7 @@ import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hbase.thirdparty.io.netty.util.HashedWheelTimer;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
@@ -83,6 +85,15 @@ class AsyncClusterConnectionImpl extends AsyncConnectionImpl implements AsyncClu
     return new AsyncRegionReplicaReplayRetryingCaller(RETRY_TIMER, this,
       ConnectionUtils.retries2Attempts(retries), operationTimeoutNs, tableName, encodedRegionName,
       row, entries, replicaId).call();
+  }
+
+  @Override
+  public CompletableFuture<Long> replay(TableName tableName, byte[] encodedRegionName,
+    List<Entry> entries, int replicaId, int numRetries, long operationTimeoutNs,
+    HRegionLocation loc) {
+    return new AsyncRegionReplicaReplayRetryingCaller(RETRY_TIMER, this,
+      ConnectionUtils.retries2Attempts(numRetries), operationTimeoutNs, tableName, encodedRegionName,
+      entries, loc, replicaId).call();
   }
 
   @Override

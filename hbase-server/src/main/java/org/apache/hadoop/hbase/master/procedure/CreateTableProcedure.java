@@ -120,6 +120,9 @@ public class CreateTableProcedure
           break;
         case CREATE_TABLE_POST_OPERATION:
           postCreate(env);
+          if (tableDescriptor.getRegionReplication() > 1) {
+            ServerRegionReplicaUtil.setupRegionReplicaReplication(env.getMasterConfiguration());
+          }
           return Flow.NO_MORE_STATE;
         default:
           throw new UnsupportedOperationException("unhandled state=" + state);
@@ -376,9 +379,11 @@ public class CreateTableProcedure
     addRegionsToMeta(env, tableDescriptor, newRegions);
 
     // Setup replication for region replicas if needed
+    /*
     if (tableDescriptor.getRegionReplication() > 1) {
       ServerRegionReplicaUtil.setupRegionReplicaReplication(env.getMasterConfiguration());
     }
+     */
     return newRegions;
   }
 

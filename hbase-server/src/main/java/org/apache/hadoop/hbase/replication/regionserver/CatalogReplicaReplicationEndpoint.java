@@ -19,9 +19,12 @@
 package org.apache.hadoop.hbase.replication.regionserver;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -34,25 +37,31 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionLocation;
+import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.RegionLocations;
 import org.apache.hadoop.hbase.ScheduledChore;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.client.AsyncClusterConnection;
+import org.apache.hadoop.hbase.client.AsyncTableRegionLocator;
 import org.apache.hadoop.hbase.client.RegionInfo;
+import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.RegionReplicaUtil;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.regionserver.FlushRequester;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.replication.BaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.WALEntryFilter;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos;
 import org.apache.hadoop.hbase.util.AtomicUtils;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FutureUtils;
@@ -61,6 +70,7 @@ import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.util.RetryCounterFactory;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
+import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,10 +88,6 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   private static final Logger LOG = LoggerFactory.getLogger(CatalogReplicaReplicationEndpoint.class);
 
-  // Can be configured differently than hbase.client.retries.number
-  private static String CLIENT_RETRIES_NUMBER =
-    "hbase.region.replica.replication.client.retries.number";
-
   private Configuration conf;
   private AsyncClusterConnection connection;
 
@@ -89,10 +95,29 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   private long operationTimeoutNs;
 
-  private final RetryCounterFactory retryCounterFactory =
-    new RetryCounterFactory(Integer.MAX_VALUE, 1000, 60000);
+  // Primary region
+  public Region region;
 
   private CatalogReplicaShipper[] replicaShippers;
+  private byte[][] replicatedFamilies;
+  private long skippedEdits;
+  private long shippedEdits;
+
+  public CatalogReplicaReplicationEndpoint () {
+    replicatedFamilies = new byte[][] { HConstants.CATALOG_FAMILY };
+  }
+
+  public CatalogReplicaReplicationEndpoint (final Region region) {
+    this.region = region;
+  }
+
+  public long getShippedEdits() {
+    return shippedEdits;
+  }
+
+  public long getSkippedEdits() {
+    return skippedEdits;
+  }
 
   @Override
   public void init(Context context) throws IOException {
@@ -114,6 +139,20 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       TimeUnit.MILLISECONDS.toNanos(conf.getInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,
         HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT));
     this.connection = context.getServer().getAsyncClusterConnection();
+
+    // Initialize replicaShippers, not all replica location are filled in at this moment.
+    int numReplicas = region.getTableDescriptor().getRegionReplication();
+    assert(numReplicas > 1);
+
+    replicaShippers = new CatalogReplicaShipper[numReplicas - 1];
+
+    for (int i = 1; i < numReplicas; i ++) {
+      // It leaves each ReplicaShipper to resolve its replica region location.
+      replicaShippers[i - 1] = new CatalogReplicaShipper(this, this.connection, null,
+        RegionInfoBuilder.newBuilder(region.getRegionInfo()).setReplicaId(i).build());
+
+      replicaShippers[i -1].start();
+    }
   }
 
   /**
@@ -121,26 +160,83 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
    * operations (e.g. flush) and use the user HTD flag to decide whether or not replicate the
    * memstore.
    */
-  private boolean requiresReplication(Entry entry) {
+  private boolean requiresReplication(final WALEdit edit) {
+
+    // TODO: let meta edits go through. Need to filter out flush events which are not for
+    // targetting families.
+    if (edit.isMetaEdit()) {
+      return true;
+    }
     // empty edit does not need to be replicated
-    if (entry.getEdit().isEmpty()) {
+    if (edit.isEmpty()) {
       return false;
     }
-    // meta edits (e.g. flush) must be always replicated
-    return entry.getEdit().isMetaEdit();
+
+    for (byte[] fam : replicatedFamilies) {
+      if (edit.getFamilies().contains(fam)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   @Override
   public boolean replicate(ReplicateContext replicateContext) {
-    Iterator<Entry> itr = replicateContext.getEntries().iterator();
+    // Breaks up meta event COMMIT_FLUSH
+    List<Entry> origList = replicateContext.getEntries().stream().collect(Collectors.toList());
+    ListIterator<Entry> itr = origList.listIterator();
+    List<List<Entry>> entries = new ArrayList<>();
+    int startIndex = 0;
+    List<Entry> subList;
+
+    // If there is COMMIT_FLUSH event in the edits, it needs to be separated so it can
+    // be processed accordingly.
     while (itr.hasNext()) {
-      if (!requiresReplication(itr.next())) {
+      Entry e = itr.next();
+      WALEdit edit = e.getEdit();
+      if (!requiresReplication(edit)) {
+        skippedEdits ++;
         itr.remove();
+        continue;
+      }
+      shippedEdits ++;
+      int editIndex = itr.previousIndex();
+
+      // seperate COMMIT_FLUSH into its own list.
+      if (edit.isMetaEdit()) {
+        try {
+          WALProtos.FlushDescriptor flushDesc = WALEdit.getCommitFlushDescriptor(
+            edit.getCells().get(0));
+          if (flushDesc != null) {
+            if (editIndex> startIndex) {
+              entries.add(origList.subList(startIndex, editIndex));
+            }
+            subList = new ArrayList<>(1);
+            subList.add(e);
+            entries.add(subList);
+            startIndex = editIndex + 1;
+          }
+        } catch (IOException ioe) {
+          LOG.warn("Failed to parse {}", e.getEdit().getCells().get(0));
+        }
       }
     }
 
-    for (CatalogReplicaShipper shipper : replicaShippers) {
-      shipper.addEditEntry(replicateContext.getEntries());
+    if (startIndex == 0) {
+      if (!origList.isEmpty()) {
+        entries.add(origList);
+      }
+    } else {
+      if (startIndex < origList.size()) {
+        entries.add(origList.subList(startIndex, origList.size()));
+      }
+    }
+
+    for (List<Entry> l : entries) {
+      for (CatalogReplicaShipper shipper : replicaShippers) {
+        shipper.addEditEntry(l);
+      }
     }
     return true;
   }
@@ -168,6 +264,10 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   @Override
   public void stop() {
+    // Stop shippers
+    for (CatalogReplicaShipper s : replicaShippers) {
+      s.setRunning(false);
+    }
     stopAsync();
   }
 
@@ -194,38 +294,52 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
     private LinkedBlockingQueue<List<Entry>> queue;
     private final AsyncClusterConnection conn;
     //Indicates whether this particular worker is running
-    private boolean isRunning = true;
-    private HRegionLocation location;
-    private final TableDescriptor td = null;
+    private volatile boolean isRunning = true;
+    private HRegionLocation location = null;
     private RegionInfo regionInfo;
     private int numRetries;
     private long operationTimeoutNs;
-
+    private AsyncTableRegionLocator locator;
 
     CatalogReplicaShipper (final CatalogReplicaReplicationEndpoint endpoint,
-      final AsyncClusterConnection connection) {
+      final AsyncClusterConnection connection, final HRegionLocation loc,
+      final RegionInfo regionInfo) {
       this.endpoint = endpoint;
       this.conn = connection;
+      this.location = loc;
+      this.regionInfo = regionInfo;
       this.queue = new LinkedBlockingQueue<>();
       this.numRetries = endpoint.getNumRetries();
       this.operationTimeoutNs = endpoint.getOperationTimeoutNs();
-
+      locator = conn.getRegionLocator(regionInfo.getTable());
     }
 
     private void cleanQueue(final long startFlushSeqOpId) {
       // remove entries with seq# less than startFlushSeqOpId
-      // TODO: needs more touchup.
+
+      // TODO: right now, it is kind of simplified. It assumes one family in the queue.
+      // In the future, if more families are involved, it needs to have family into
+      // consideration.
       queue.removeIf(n -> (n.get(0).getKey().getSequenceId() < startFlushSeqOpId));
     }
 
-    // TODO: this needs revisit.
     public void addEditEntry(final List<Entry> entries) {
       try {
-        // TODO: for start_flush/commit_flush, it is going to be only one walEdit in the batch
-        // logic such as following needs to be added.
-        //  if (entries.get(0).getKey is commit_flush) {
-        //    cleanQueue(0);
-        //  }
+        if ((entries.size() == 1) && entries.get(0).getEdit().isMetaEdit()) {
+          try {
+            // When it is a COMMIT_FLUSH event, it can remove all edits in the queue whose
+            // seq# is less flushSeq#. Those events include flush events and
+            // OPEN_REGION/CLOSE_REGION events, as they work like flush events.
+            WALProtos.FlushDescriptor flushDesc = WALEdit.getCommitFlushDescriptor(
+              entries.get(0).getEdit().getCells().get(0));
+            if (flushDesc != null) {
+              LOG.info("SHX1, cleaned the queue");
+              cleanQueue(flushDesc.getFlushSequenceNumber());
+            }
+          } catch (IOException ioe) {
+            LOG.warn("Failed to parse {}", entries.get(0).getEdit().getCells().get(0));
+          }
+        }
         queue.put(entries);
       } catch (InterruptedException e) {
 
@@ -234,17 +348,12 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
     private CompletableFuture<Long> replicate(List<Entry> entries) {
       CompletableFuture<Long> future = new CompletableFuture<>();
-      // For MetaFamily such flush events, the key is the start key of the region,
-      // just reuse same thing here.
-      byte[] row = CellUtil.cloneRow(entries.get(0).getEdit().getCells().get(0));
       FutureUtils
-        .addListener(conn.replay(td.getTableName(), regionInfo.getEncodedNameAsBytes(),
-          row, entries, regionInfo.getReplicaId(), 1, operationTimeoutNs), (r, e) -> {
+        .addListener(conn.replay(regionInfo.getTable(), regionInfo.getEncodedNameAsBytes(), entries,
+          regionInfo.getReplicaId(), 1, operationTimeoutNs, location), (r, e) -> {
           if (e != null) {
             LOG.warn("Failed to replicate to {}", regionInfo, e);
             future.completeExceptionally(e);
-            // TODO: need to refresh meta location in case of error. Different Exception handled
-            // differently?
           } else {
             future.complete(r.longValue());
           }
@@ -255,8 +364,26 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
     @Override
     public final void run() {
+      boolean reload = false;
       while (isRunning()) { // we only loop back here if something fatal happened to our stream
+        if (location == null) {
+          // If location is null, keep searching for it. This applies to replica region server
+          // crashes, and waiting to be assigned. reload flag will be set accordingly in case of
+          // error.
+          try {
+            location = locator.getRegionLocation(regionInfo.getStartKey(),
+              regionInfo.getReplicaId(), reload).get();
+          } catch (ExecutionException ee) {
+            LOG.warn("Error getting location for meta region " +regionInfo + ", " + ee);
+            reload = true;
+            continue;
+          } catch (InterruptedException ie) {
+            LOG.warn("Interrupted while getting location for meta region " +regionInfo + ", " + ie);
+            Thread.currentThread().interrupt();
+          }
+        }
         try {
+          //Thread.sleep(15000);
           List<Entry> entries = queue.poll(20000, TimeUnit.MILLISECONDS);
           if (entries == null) {
             continue;
@@ -266,7 +393,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
             replicate(entries);
 
           try {
-            future.get().longValue();
+            future.get();
           } catch (InterruptedException e) {
             // restore the interrupted state
             Thread.currentThread().interrupt();
@@ -274,6 +401,12 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
           } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             LOG.warn("Failed to replicate {} entries for region  of meta table", entries.size());
+            // If Exception is NotServingRegion, it needs to reload location.
+            if (cause instanceof NotServingRegionException) {
+              location = null;
+              reload = true;
+            }
+            // TODO: do we give up the current edits.
           }
         } catch (InterruptedException | ReplicationRuntimeException e) {
           // It is interrupted and needs to quit.
@@ -281,7 +414,6 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
           Thread.currentThread().interrupt();
         }
       }
-      // TODO: what if it breaks the loop now.
     }
 
     /**

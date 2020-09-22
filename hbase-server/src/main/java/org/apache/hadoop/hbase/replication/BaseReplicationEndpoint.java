@@ -20,7 +20,13 @@ package org.apache.hadoop.hbase.replication;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
 
+import org.apache.hadoop.hbase.RegionLocations;
+import org.apache.hadoop.hbase.client.TableDescriptor;
+import org.apache.hadoop.hbase.client.AsyncClusterConnection;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,7 +46,39 @@ public abstract class BaseReplicationEndpoint extends AbstractService
   private static final Logger LOG = LoggerFactory.getLogger(BaseReplicationEndpoint.class);
   public static final String REPLICATION_WALENTRYFILTER_CONFIG_KEY
       = "hbase.replication.source.custom.walentryfilters";
+  // Can be configured differently than hbase.client.retries.number
+  public static final String CLIENT_RETRIES_NUMBER =
+    "hbase.region.replica.replication.client.retries.number";
+
   protected Context ctx;
+
+  public static void getRegionLocations(CompletableFuture<RegionLocations> future,
+    final AsyncClusterConnection connection,
+    final TableDescriptor tableDesc, byte[] encodedRegionName, byte[] row, boolean reload) {
+    FutureUtils.addListener(connection.getRegionLocations(tableDesc.getTableName(), row, reload),
+      (locs, e) -> {
+        if (e != null) {
+          future.completeExceptionally(e);
+          return;
+        }
+        // if we are not loading from cache, just return
+        if (reload) {
+          future.complete(locs);
+          return;
+        }
+        // check if the number of region replicas is correct, and also the primary region name
+        // matches.
+        if (locs.size() == tableDesc.getRegionReplication() &&
+          locs.getDefaultRegionLocation() != null &&
+          Bytes.equals(locs.getDefaultRegionLocation().getRegion().getEncodedNameAsBytes(),
+            encodedRegionName)) {
+          future.complete(locs);
+        } else {
+          // reload again as the information in cache maybe stale
+          getRegionLocations(future, connection, tableDesc, encodedRegionName, row, true);
+        }
+      });
+  }
 
   @Override
   public void init(Context context) throws IOException {

@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.client;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.RegionLocations;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -62,6 +63,13 @@ public interface AsyncClusterConnection extends AsyncConnection {
    */
   CompletableFuture<Long> replay(TableName tableName, byte[] encodedRegionName, byte[] row,
       List<Entry> entries, int replicaId, int numRetries, long operationTimeoutNs);
+
+  /**
+   * Replicate wal edits for replica regions. The return value is the edits we skipped, as the
+   * original return value is useless.
+   */
+  CompletableFuture<Long> replay(TableName tableName, byte[] encodedRegionName, List<Entry> entries,
+    int replicaId, int numRetries, long operationTimeoutNs, HRegionLocation loc);
 
   /**
    * Return all the replicas for a region. Used for region replica replication.

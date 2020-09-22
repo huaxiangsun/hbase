@@ -33,6 +33,7 @@ import org.apache.hadoop.hbase.io.Reference;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.replication.ReplicationPeerConfig;
+import org.apache.hadoop.hbase.replication.regionserver.CatalogReplicaReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.regionserver.RegionReplicaReplicationEndpoint;
 import org.apache.hadoop.hbase.zookeeper.ZKConfig;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -179,7 +180,8 @@ public class ServerRegionReplicaUtil extends RegionReplicaUtil {
           + " not exist. Creating...");
         peerConfig = new ReplicationPeerConfig();
         peerConfig.setClusterKey(ZKConfig.getZooKeeperClusterKey(conf));
-        peerConfig.setReplicationEndpointImpl(RegionReplicaReplicationEndpoint.class.getName());
+        //peerConfig.setReplicationEndpointImpl(RegionReplicaReplicationEndpoint.class.getName());
+        peerConfig.setReplicationEndpointImpl(CatalogReplicaReplicationEndpoint.class.getName());
         admin.addReplicationPeer(REGION_REPLICA_REPLICATION_PEER, peerConfig);
       }
     }

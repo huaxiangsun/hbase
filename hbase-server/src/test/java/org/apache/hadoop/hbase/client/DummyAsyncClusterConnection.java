@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.RegionLocations;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -127,6 +128,13 @@ public class DummyAsyncClusterConnection implements AsyncClusterConnection {
   @Override
   public CompletableFuture<Long> replay(TableName tableName, byte[] encodedRegionName, byte[] row,
       List<Entry> entries, int replicaId, int numRetries, long operationTimeoutNs) {
+    return null;
+  }
+
+  @Override
+  public CompletableFuture<Long> replay(TableName tableName, byte[] encodedRegionName,
+    List<Entry> entries, int replicaId, int numRetries, long operationTimeoutNs,
+    HRegionLocation loc) {
     return null;
   }
 

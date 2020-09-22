@@ -158,6 +158,7 @@ import org.apache.hadoop.hbase.regionserver.throttle.NoLimitThroughputController
 import org.apache.hadoop.hbase.regionserver.throttle.StoreHotnessProtector;
 import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;
 import org.apache.hadoop.hbase.regionserver.wal.WALUtil;
+import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.ReplicationUtils;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationObserver;
 import org.apache.hadoop.hbase.security.User;
@@ -430,6 +431,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
   private volatile Long timeoutForWriteLock = null;
 
   private final CellComparator cellComparator;
+
+  public ReplicationEndpoint endpoint;
 
   /**
    * @return The smallest mvcc readPoint across all the scanners in this

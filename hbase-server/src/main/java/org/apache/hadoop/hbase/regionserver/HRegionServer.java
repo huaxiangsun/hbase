@@ -47,6 +47,7 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -142,6 +143,8 @@ import org.apache.hadoop.hbase.namequeues.NamedQueueRecorder;
 import org.apache.hadoop.hbase.namequeues.SlowLogTableOpsChore;
 import org.apache.hadoop.hbase.regionserver.throttle.FlushThroughputControllerFactory;
 import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;
+import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
+import org.apache.hadoop.hbase.replication.regionserver.CatalogReplicaReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationLoad;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceInterface;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationStatus;
@@ -2452,6 +2455,7 @@ public class HRegionServer extends Thread implements
     if (ServerRegionReplicaUtil.isDefaultReplica(region.getRegionInfo())) {
       return;
     }
+
     if (!ServerRegionReplicaUtil.isRegionReplicaReplicationEnabled(region.conf) ||
         !ServerRegionReplicaUtil.isRegionReplicaWaitForPrimaryFlushEnabled(
           region.conf)) {

@@ -315,6 +315,15 @@ public class ReplicationSource implements ReplicationSourceInterface {
             .asSubclass(ReplicationEndpoint.class)
             .getDeclaredConstructor()
             .newInstance();
+
+        {
+          // Hack
+          if (!((HRegionServer)this.server).getRegions(TableName.valueOf("testRegionReplicaReplicationWithReplicas")).isEmpty()) {
+            ((CatalogReplicaReplicationEndpoint)replicationEndpoint).region =
+              ((HRegionServer)this.server).getRegions(TableName.valueOf("testRegionReplicaReplicationWithReplicas")).get(0);
+
+          }
+        }
       } catch (NoSuchMethodException | InvocationTargetException e) {
         throw new IllegalArgumentException(e);
       }

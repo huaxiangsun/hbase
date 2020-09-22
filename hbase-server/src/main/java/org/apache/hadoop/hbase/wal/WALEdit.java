@@ -320,6 +320,15 @@ public class WALEdit implements HeapSize {
         FlushDescriptor.parseFrom(CellUtil.cloneValue(cell)): null;
   }
 
+  public static FlushDescriptor getCommitFlushDescriptor(Cell cell) throws IOException {
+    FlushDescriptor desc =  getFlushDescriptor(cell);
+    if ((desc != null) && desc.getAction() != WALProtos.FlushDescriptor.FlushAction.COMMIT_FLUSH) {
+        desc = null;
+    }
+    return desc;
+  }
+
+
   /**
    * @return A meta Marker WALEdit that has a single Cell whose value is the passed in
    *   <code>regionEventDesc</code> serialized and whose row is this region,

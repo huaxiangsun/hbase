@@ -1942,8 +1942,26 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
     return createTableDescriptor(tableName, new byte[][] { family }, 1);
   }
 
+  public TableDescriptor createTableDescriptor(final TableName tableName, int replica, byte[] family) {
+    TableDescriptorBuilder builder = TableDescriptorBuilder.newBuilder(tableName);
+    ColumnFamilyDescriptorBuilder cfBuilder =
+      ColumnFamilyDescriptorBuilder.newBuilder(family).setMaxVersions(1);
+    if (isNewVersionBehaviorEnabled()) {
+      cfBuilder.setNewVersionBehavior(true);
+    }
+    builder.setColumnFamily(cfBuilder.build());
+    builder.setRegionReplication(replica);
+    return builder.build();
+  }
+
+
   public TableDescriptor createTableDescriptor(final TableName tableName, byte[][] families,
     int maxVersions) {
+    return createTableDescriptor(tableName, 1, families, maxVersions);
+  }
+
+  public TableDescriptor createTableDescriptor(final TableName tableName, int replica,
+    byte[][] families, int maxVersions) {
     TableDescriptorBuilder builder = TableDescriptorBuilder.newBuilder(tableName);
     for (byte[] family : families) {
       ColumnFamilyDescriptorBuilder cfBuilder =
@@ -1953,6 +1971,8 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
       }
       builder.setColumnFamily(cfBuilder.build());
     }
+
+    builder.setRegionReplication(replica);
     return builder.build();
   }
 
