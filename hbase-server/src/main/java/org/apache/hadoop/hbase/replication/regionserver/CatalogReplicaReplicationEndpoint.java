@@ -190,7 +190,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
     int startIndex = 0;
     List<Entry> subList;
 
-    // If there is COMMIT_FLUSH event in the edits, it needs to be separated so it can
+    // If there are START_FLUSH and COMMIT_FLUSH event in the edits, it needs to be separated so it can
     // be processed accordingly.
     while (itr.hasNext()) {
       Entry e = itr.next();
@@ -206,8 +206,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       // seperate COMMIT_FLUSH into its own list.
       if (edit.isMetaEdit()) {
         try {
-          WALProtos.FlushDescriptor flushDesc = WALEdit.getCommitFlushDescriptor(
-            edit.getCells().get(0));
+          WALProtos.FlushDescriptor flushDesc = WALEdit.getFlushDescriptor(edit.getCells().get(0));
           if (flushDesc != null) {
             if (editIndex> startIndex) {
               entries.add(origList.subList(startIndex, editIndex));
@@ -320,7 +319,27 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       // TODO: right now, it is kind of simplified. It assumes one family in the queue.
       // In the future, if more families are involved, it needs to have family into
       // consideration.
+      Iterator<List<Entry>> iterator = queue.iterator();
+      while (iterator.hasNext()) {
+        List<Entry> l = iterator.next();
+        for (Entry ll : l) {
+          LOG.info("LSHX " + ll.getEdit());
+          LOG.info("LSHX " + ll.getKey());
+        }
+      }
+
+      // TODO: if there are multiple edits in the list, need to remove them one by one.
       queue.removeIf(n -> (n.get(0).getKey().getSequenceId() < startFlushSeqOpId));
+
+      iterator = queue.iterator();
+      while (iterator.hasNext()) {
+        List<Entry> l = iterator.next();
+        for (Entry ll : l) {
+          LOG.info("LLSHX " + ll.getEdit());
+          LOG.info("LLSHX " + ll.getKey());
+        }
+      }
+
     }
 
     public void addEditEntry(final List<Entry> entries) {
@@ -333,7 +352,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
             WALProtos.FlushDescriptor flushDesc = WALEdit.getCommitFlushDescriptor(
               entries.get(0).getEdit().getCells().get(0));
             if (flushDesc != null) {
-              LOG.info("SHX1, cleaned the queue");
+              LOG.info("SHX1, cleaned the queue" + flushDesc.getFlushSequenceNumber());
               cleanQueue(flushDesc.getFlushSequenceNumber());
             }
           } catch (IOException ioe) {
@@ -383,7 +402,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
           }
         }
         try {
-          //Thread.sleep(15000);
+          Thread.sleep(150000);
           List<Entry> entries = queue.poll(20000, TimeUnit.MILLISECONDS);
           if (entries == null) {
             continue;

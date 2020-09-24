@@ -2636,9 +2636,16 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
   protected FlushResultImpl internalFlushcache(WAL wal, long myseqid,
       Collection<HStore> storesToFlush, MonitoredTask status, boolean writeFlushWalMarker,
       FlushLifeCycleTracker tracker) throws IOException {
+    LOG.info("SSHX start");
     PrepareFlushResult result =
         internalPrepareFlushCache(wal, myseqid, storesToFlush, status, writeFlushWalMarker, tracker);
     if (result.result == null) {
+      try {
+        Thread.sleep(3000);
+      } catch (InterruptedException e) {
+
+      }
+      LOG.info("SSHX start 2");
       return internalFlushCacheAndCommit(wal, status, result, storesToFlush);
     } else {
       return result.result; // early exit due to failure from prepare stage

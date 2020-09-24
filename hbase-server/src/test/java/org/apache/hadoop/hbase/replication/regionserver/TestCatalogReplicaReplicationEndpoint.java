@@ -256,7 +256,7 @@ public class TestCatalogReplicaReplicationEndpoint {
     // to their stores
     //TableName tableName = TableName.valueOf(name.getMethodName());
     TableName tableName = TableName.valueOf("testRegionReplicaReplicationWithReplicas");
-    int regionReplication = 3;
+    int regionReplication = 2;
 
     TableDescriptor htd = HTU.createTableDescriptor(tableName,
       regionReplication, new byte[][] {HConstants.CATALOG_FAMILY, HConstants.TABLE_FAMILY}, 1);
@@ -269,13 +269,32 @@ public class TestCatalogReplicaReplicationEndpoint {
     try {
       // load the data to the table
 
-      for (int i = 0; i < 6000; i += 1000) {
-        LOG.info("Writing data from " + i + " to " + (i+1000));
-        HTU.loadNumericRows(table, HConstants.CATALOG_FAMILY, i, i+1000);
+      for (int i = 0; i < 5; i ++) {
+        LOG.info("Writing data from " + i + " to " + (i+1));
+        HTU.loadNumericRows(table, HConstants.CATALOG_FAMILY, i, i+1);
         LOG.info("flushing table");
+        Thread loader = new Thread() {
+          @Override
+          public void run() {
+            for (int i = 0; i < 10; i ++) {
+              try {
+                Thread.sleep(50);
+                LOG.info("shxWriting data from " + (i + 1000) + " to " + (i + 1001));
+                HTU.loadNumericRows(table, HConstants.CATALOG_FAMILY, i + 1000, i + 1001);
+              } catch (IOException ee) {
+
+              } catch (InterruptedException e) {
+
+              }
+            }
+          }
+        };
+        loader.start();
         HTU.flush(tableName);
         LOG.info("compacting table");
-        HTU.compact(tableName, false);
+        if (i < 4) {
+          HTU.compact(tableName, false);
+        }
       }
 
       verifyReplication(tableName, regionReplication, 0, 6000,

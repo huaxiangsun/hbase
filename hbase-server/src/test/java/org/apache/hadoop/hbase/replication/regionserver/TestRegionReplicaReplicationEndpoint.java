@@ -396,7 +396,7 @@ public class TestRegionReplicaReplicationEndpoint {
     // tests having edits from a disabled or dropped table is handled correctly by skipping those
     // entries and further edits after the edits from dropped/disabled table can be replicated
     // without problems.
-    int regionReplication = 3;
+    int regionReplication = 2;
     TableDescriptor htd = HTU
       .createModifyableTableDescriptor(
         name.getMethodName() + "_drop_" + dropTable + "_disabledReplication_" + disableReplication)
