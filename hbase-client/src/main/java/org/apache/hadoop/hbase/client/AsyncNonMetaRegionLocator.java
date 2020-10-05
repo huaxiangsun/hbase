@@ -90,6 +90,7 @@ class AsyncNonMetaRegionLocator {
   private final int locatePrefetchLimit;
 
   private final boolean useMetaReplicas;
+  // This needs to be changed to a mode, metaReplicasHa, metaReplicaLb (load balance)
 
   private final ConcurrentMap<TableName, TableCache> cache = new ConcurrentHashMap<>();
 
@@ -433,15 +434,25 @@ class AsyncNonMetaRegionLocator {
     Scan scan = new Scan().withStartRow(metaStartKey).withStopRow(metaStopKey, true)
       .addFamily(HConstants.CATALOG_FAMILY).setReversed(true).setCaching(locatePrefetchLimit)
       .setReadType(ReadType.PREAD);
+
     if (useMetaReplicas) {
+      // SHX, this is where we hook in meta replica LB logic.
       scan.setConsistency(Consistency.TIMELINE);
     }
+    // SHX, in case of metaReplicaLb mode, need to call metaReplicaPicker to find a replica.
+    // in case of primary region, no TIMELINE is set since it will only be unicast. In case of
+    // picking up a replica region, TIMELINE needs to be set. For result back, it needs to
+    // set a replicId (which will come from the request itself as the response does not contain
+    // replicaId, it only has a stale bit which indicates if the result is from primary or non-primary).
     conn.getTable(META_TABLE_NAME).scan(scan, new AdvancedScanResultConsumer() {
 
       private boolean completeNormally = false;
 
       private boolean tableNotFound = true;
 
+      // SHX: these error conditions needs to be handled as well. Let's when the request is sent
+      // to one of replicas, and it runs into errors such the replica region is moved, slow
+      // in processing, in this LB mode, it needs to switch to another replica.
       @Override
       public void onError(Throwable error) {
         complete(tableName, req, null, error);
@@ -488,6 +499,10 @@ class AsyncNonMetaRegionLocator {
             if (info == null || info.isOffline() || info.isSplitParent()) {
               continue;
             }
+
+            // SHX, this is the place where we should add replicaId for locations.
+            // Whether we should add how many times replica has been tried is up to question.
+            // When updateLocationOnError, we can decide what to do.
             RegionLocations addedLocs = addToCache(tableCache, locs);
             synchronized (tableCache) {
               tableCache.clearCompletedRequests(addedLocs);
@@ -519,6 +534,8 @@ class AsyncNonMetaRegionLocator {
         return CompletableFuture.completedFuture(locs);
       }
     }
+
+    // SHX, above so far, the logic is same for default and LB.
     CompletableFuture<RegionLocations> future;
     LocateRequest req;
     boolean sendRequest = false;
@@ -541,6 +558,8 @@ class AsyncNonMetaRegionLocator {
         }
       }
     }
+    // SHX, this is also same for  default and LB.
+
     if (sendRequest) {
       locateInMeta(tableName, req);
     }

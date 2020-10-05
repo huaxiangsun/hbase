@@ -90,6 +90,17 @@ final class AsyncRegionLocatorHelper {
       }
       removeFromCache.accept(loc);
       // TODO: SHX, in this case, we need to go to primary if this is the case?
+      // can we design a module, say MetaChooser, it has couple methods.
+      // 1. removeCacheOnError
+      //    It will build up internal state so when chooseRegionToGo() is called, the state will
+      //    provide info to make decision.
+      // 2. chooseRegionToGo
+      //    Based on info from 1), it is going to decide which Meta Region to go next.
+      // 3. When to remove state in MetaChooser?
+      //    a. Can it be removed after chooseRegionToGo()? or
+      //    b. When a correct answer is from meta, check MetaChooser to clean state.
+      //    or when there is
+      //    There is a cleanup thread in case those entries are not cleaned up in step 3.
     }
   }
 
