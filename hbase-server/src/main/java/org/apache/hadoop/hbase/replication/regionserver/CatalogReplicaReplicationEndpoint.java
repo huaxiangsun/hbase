@@ -19,62 +19,36 @@
 package org.apache.hadoop.hbase.replication.regionserver;
 
 import java.io.IOException;
-import java.io.InterruptedIOException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
-import java.util.Optional;
-import java.util.TreeMap;
 import java.util.UUID;
-import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.CellUtil;
-import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.NotServingRegionException;
-import org.apache.hadoop.hbase.RegionLocations;
-import org.apache.hadoop.hbase.ScheduledChore;
-import org.apache.hadoop.hbase.TableName;
-import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.client.AsyncClusterConnection;
 import org.apache.hadoop.hbase.client.AsyncTableRegionLocator;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
-import org.apache.hadoop.hbase.client.RegionReplicaUtil;
-import org.apache.hadoop.hbase.client.TableDescriptor;
-import org.apache.hadoop.hbase.regionserver.FlushRequester;
-import org.apache.hadoop.hbase.regionserver.HRegion;
-import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.replication.BaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.WALEntryFilter;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos;
-import org.apache.hadoop.hbase.util.AtomicUtils;
-import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FutureUtils;
-import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.RetryCounter;
-import org.apache.hadoop.hbase.util.RetryCounterFactory;
-import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import static org.apache.hadoop.hbase.replication.ReplicationUtils.sleepForRetries;
 
 /**
  * A {@link org.apache.hadoop.hbase.replication.ReplicationEndpoint} endpoint which receives the WAL
@@ -92,11 +66,10 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
   private AsyncClusterConnection connection;
 
   private int numRetries;
-
   private long operationTimeoutNs;
 
-  // Primary region
-  public Region region;
+  // Track primary regions under replication.
+  ConcurrentHashMap<String, CatalogReplicaShipper[]> primaryRegionsUnderReplication;
 
   private CatalogReplicaShipper[] replicaShippers;
   private byte[][] replicatedFamilies;
@@ -105,10 +78,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   public CatalogReplicaReplicationEndpoint () {
     replicatedFamilies = new byte[][] { HConstants.CATALOG_FAMILY };
-  }
-
-  public CatalogReplicaReplicationEndpoint (final Region region) {
-    this.region = region;
+    primaryRegionsUnderReplication = new ConcurrentHashMap<>();
   }
 
   public long getShippedEdits() {
@@ -139,20 +109,6 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       TimeUnit.MILLISECONDS.toNanos(conf.getInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,
         HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT));
     this.connection = context.getServer().getAsyncClusterConnection();
-
-    // Initialize replicaShippers, not all replica location are filled in at this moment.
-    int numReplicas = region.getTableDescriptor().getRegionReplication();
-    assert(numReplicas > 1);
-
-    replicaShippers = new CatalogReplicaShipper[numReplicas - 1];
-
-    for (int i = 1; i < numReplicas; i ++) {
-      // It leaves each ReplicaShipper to resolve its replica region location.
-      replicaShippers[i - 1] = new CatalogReplicaShipper(this, this.connection, null,
-        RegionInfoBuilder.newBuilder(region.getRegionInfo()).setReplicaId(i).build());
-
-      replicaShippers[i -1].start();
-    }
   }
 
   /**
@@ -179,6 +135,45 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
     }
 
     return false;
+  }
+
+  private void registerRegion (final Region region) {
+    // Make sure it does not exist.
+    if (primaryRegionsUnderReplication.get(region.getRegionInfo().getEncodedName()) != null) {
+      LOG.warn("Try to register an existing regoin {}", region);
+      return;
+    }
+
+    // Initialize replicaShippers, not all replica location are filled in at this moment.
+    int numReplicas = region.getTableDescriptor().getRegionReplication();
+    assert(numReplicas > 1);
+
+    CatalogReplicaShipper[] replicaShippers = new CatalogReplicaShipper[numReplicas - 1];
+
+    for (int i = 1; i < numReplicas; i ++) {
+      // It leaves each ReplicaShipper to resolve its replica region location.
+      replicaShippers[i - 1] = new CatalogReplicaShipper(this, this.connection, null,
+        RegionInfoBuilder.newBuilder(region.getRegionInfo()).setReplicaId(i).build());
+
+      replicaShippers[i -1].start();
+    }
+
+    primaryRegionsUnderReplication.put(region.getRegionInfo().getEncodedName(), replicaShippers);
+  }
+
+  private void unregisterRegion (final Region region) {
+    // Make sure it does exist.
+    if (primaryRegionsUnderReplication.get(region.getRegionInfo().getEncodedName()) == null) {
+      LOG.warn("Try to unregister a non-existing regoin {}", region);
+      return;
+    }
+
+    CatalogReplicaShipper[] replicaShippers = primaryRegionsUnderReplication.
+      remove(region.getRegionInfo().getEncodedName());
+
+    for (CatalogReplicaShipper s : replicaShippers) {
+      s.setRunning(false);
+    }
   }
 
   @Override
@@ -264,8 +259,11 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
   @Override
   public void stop() {
     // Stop shippers
-    for (CatalogReplicaShipper s : replicaShippers) {
-      s.setRunning(false);
+    for (Map.Entry<String, CatalogReplicaShipper[]> e :
+      primaryRegionsUnderReplication.entrySet()) {
+      for (CatalogReplicaShipper s : e.getValue()) {
+        s.setRunning(false);
+      }
     }
     stopAsync();
   }
