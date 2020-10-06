@@ -24,6 +24,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -39,11 +41,15 @@ import org.apache.hadoop.hbase.client.AsyncClusterConnection;
 import org.apache.hadoop.hbase.client.AsyncTableRegionLocator;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
+import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.replication.BaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.WALEntryFilter;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FutureUtils;
+import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -69,7 +75,7 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
   private long operationTimeoutNs;
 
   // Track primary regions under replication.
-  ConcurrentHashMap<String, CatalogReplicaShipper[]> primaryRegionsUnderReplication;
+  ConcurrentHashMap<byte[], CatalogReplicaShipper[]> primaryRegionsUnderReplication;
 
   private CatalogReplicaShipper[] replicaShippers;
   private byte[][] replicatedFamilies;
@@ -137,9 +143,12 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
     return false;
   }
 
+  // Register a new primary region to the endpoint when a region is opened, it will setup
+  // to replicate its wal edits to replicas.
   private void registerRegion (final Region region) {
     // Make sure it does not exist.
-    if (primaryRegionsUnderReplication.get(region.getRegionInfo().getEncodedName()) != null) {
+    byte[] encodedName = region.getRegionInfo().getEncodedName().getBytes();
+    if (primaryRegionsUnderReplication.get(encodedName) != null) {
       LOG.warn("Try to register an existing regoin {}", region);
       return;
     }
@@ -158,18 +167,20 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
       replicaShippers[i -1].start();
     }
 
-    primaryRegionsUnderReplication.put(region.getRegionInfo().getEncodedName(), replicaShippers);
+    primaryRegionsUnderReplication.put(encodedName, replicaShippers);
   }
 
+  // Deregister a primary region from the endpoint when a region is closed, it will clean up all
+  // resources allocated for this region.
   private void unregisterRegion (final Region region) {
+    byte[] encodedName = region.getRegionInfo().getEncodedName().getBytes();
     // Make sure it does exist.
-    if (primaryRegionsUnderReplication.get(region.getRegionInfo().getEncodedName()) == null) {
-      LOG.warn("Try to unregister a non-existing regoin {}", region);
+    if (primaryRegionsUnderReplication.get(encodedName) == null) {
+      LOG.warn("Try to unregister a non-existing region {}", region);
       return;
     }
 
-    CatalogReplicaShipper[] replicaShippers = primaryRegionsUnderReplication.
-      remove(region.getRegionInfo().getEncodedName());
+    CatalogReplicaShipper[] replicaShippers = primaryRegionsUnderReplication.remove(encodedName);
 
     for (CatalogReplicaShipper s : replicaShippers) {
       s.setRunning(false);
@@ -178,6 +189,40 @@ public class CatalogReplicaReplicationEndpoint extends BaseReplicationEndpoint {
 
   @Override
   public boolean replicate(ReplicateContext replicateContext) {
+    Map<byte[], List<List<Entry>>> encodedRegionName2Entries =
+      new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    encodedRegionName2Entries.clear();
+    for (Entry entry : replicateContext.getEntries()) {
+      WALEdit edit = entry.getEdit();
+      if (!requiresReplication(edit)) {
+        skippedEdits ++;
+        continue;
+      }
+
+      // seperate COMMIT_FLUSH into its own list.
+      if (edit.isMetaEdit()) {
+        try {
+          WALProtos.FlushDescriptor flushDesc = WALEdit.getFlushDescriptor(edit.getCells().get(0));
+          if (flushDesc != null) {
+            if (editIndex> startIndex) {
+              entries.add(origList.subList(startIndex, editIndex));
+            }
+            subList = new ArrayList<>(1);
+            subList.add(e);
+            entries.add(subList);
+            startIndex = editIndex + 1;
+          }
+        } catch (IOException ioe) {
+          LOG.warn("Failed to parse {}", e.getEdit().getCells().get(0));
+        }
+
+
+        byte[] encodedRegionName = entry.getKey().getEncodedRegionName();
+      encodedRegionName2Entries
+        .computeIfAbsent(encodedRegionName, k -> Pair.newPair(tableDesc.get(), new ArrayList<>()))
+        .getSecond().add(entry);
+    }
+
     // Breaks up meta event COMMIT_FLUSH
     List<Entry> origList = replicateContext.getEntries().stream().collect(Collectors.toList());
     ListIterator<Entry> itr = origList.listIterator();
